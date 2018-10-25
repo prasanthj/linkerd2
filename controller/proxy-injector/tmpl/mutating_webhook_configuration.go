@@ -17,7 +17,7 @@ webhooks:
   - operations: [ "CREATE" ]
     apiGroups: ["apps", "extensions"]
     apiVersions: ["v1", "v1beta1", "v1beta2"]
-    resources: ["deployments"]
+    resources: ["deployments", "statefulsets"]
   namespaceSelector:
     matchExpressions:
     - key: {{.ProxyAutoInjectLabel}}

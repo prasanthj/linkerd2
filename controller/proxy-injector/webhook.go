@@ -96,19 +96,34 @@ func (w *Webhook) decode(data []byte) (*admissionv1beta1.AdmissionReview, error)
 }
 
 func (w *Webhook) inject(request *admissionv1beta1.AdmissionRequest) (*admissionv1beta1.AdmissionResponse, error) {
-	var deployment appsv1.Deployment
-	if err := yaml.Unmarshal(request.Object.Raw, &deployment); err != nil {
-		return nil, err
+	switch request.Kind.Kind {
+		case "Deployment":
+			var deployment appsv1.Deployment
+			if err := yaml.Unmarshal(request.Object.Raw, &deployment); err != nil {
+				return nil, err
+			}
+			log.Infof("working on %s/%s %s..", request.Kind.Version, strings.ToLower(request.Kind.Kind), deployment.ObjectMeta.Name)
+			return w.injectForDeployment(request, &deployment)
+		case "StatefulSet":
+			var statefulSet appsv1.StatefulSet
+			if err := yaml.Unmarshal(request.Object.Raw, &statefulSet); err != nil {
+				return nil, err
+			}
+			log.Infof("working on %s/%s %s..", request.Kind.Version, strings.ToLower(request.Kind.Kind), statefulSet.ObjectMeta.Name)
+			return w.injectForStatefulSet(request, &statefulSet)
+		default:
+			return nil, fmt.Errorf("unsupported resource object: %v", request.Kind.Kind)
 	}
-	log.Infof("working on %s/%s %s..", request.Kind.Version, strings.ToLower(request.Kind.Kind), deployment.ObjectMeta.Name)
+}
 
+func (w *Webhook) injectForDeployment(request *admissionv1beta1.AdmissionRequest, deployment *appsv1.Deployment) (*admissionv1beta1.AdmissionResponse, error) {
 	ns := request.Namespace
 	if ns == "" {
 		ns = defaultNamespace
 	}
 	log.Infof("resource namespace: %s", ns)
 
-	if w.ignore(&deployment) {
+	if w.ignoreDeployment(deployment) {
 		log.Infof("ignoring deployment %s", deployment.ObjectMeta.Name)
 		return &admissionv1beta1.AdmissionResponse{
 			UID:     request.UID,
@@ -202,7 +217,108 @@ func (w *Webhook) inject(request *admissionv1beta1.AdmissionRequest) (*admission
 	return admissionResponse, nil
 }
 
-func (w *Webhook) ignore(deployment *appsv1.Deployment) bool {
+func (w *Webhook) injectForStatefulSet(request *admissionv1beta1.AdmissionRequest, statefulSet *appsv1.StatefulSet) (*admissionv1beta1.AdmissionResponse, error) {
+	ns := request.Namespace
+	if ns == "" {
+		ns = defaultNamespace
+	}
+	log.Infof("resource namespace: %s", ns)
+
+	if w.ignoreStatefulSet(statefulSet) {
+		log.Infof("ignoring statefulSet %s", statefulSet.ObjectMeta.Name)
+		return &admissionv1beta1.AdmissionResponse{
+			UID:     request.UID,
+			Allowed: true,
+		}, nil
+	}
+
+	identity := &k8sPkg.TLSIdentity{
+		Name:                statefulSet.ObjectMeta.Name,
+		Kind:                strings.ToLower(request.Kind.Kind),
+		Namespace:           ns,
+		ControllerNamespace: w.controllerNamespace,
+	}
+	proxy, proxyInit, err := w.containersSpec(identity)
+	if err != nil {
+		return nil, err
+	}
+	log.Infof("proxy image: %s", proxy.Image)
+	log.Infof("proxy-init image: %s", proxyInit.Image)
+	log.Debugf("proxy container: %+v", proxy)
+	log.Debugf("init container: %+v", proxyInit)
+
+	caBundle, tlsSecrets, err := w.volumesSpec(identity)
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("ca bundle volume: %+v", caBundle)
+	log.Debugf("tls secrets volume: %+v", tlsSecrets)
+
+	patch := NewPatch()
+	patch.addContainer(proxy)
+
+	if len(statefulSet.Spec.Template.Spec.InitContainers) == 0 {
+		patch.addInitContainerRoot()
+	}
+	patch.addInitContainer(proxyInit, len(statefulSet.Spec.Template.Spec.InitContainers))
+
+	if len(statefulSet.Spec.Template.Spec.Volumes) == 0 {
+		patch.addVolumeRoot()
+	}
+	patch.addVolume(caBundle)
+	patch.addVolume(tlsSecrets)
+
+	if statefulSet.Spec.Template.Labels == nil {
+		statefulSet.Spec.Template.Labels = map[string]string{}
+	}
+
+	statefulSet.Spec.Template.Labels[k8sPkg.ControllerNSLabel] = w.controllerNamespace
+	statefulSet.Spec.Template.Labels[k8sPkg.ProxyStatefulSetLabel] = statefulSet.ObjectMeta.Name
+	patch.addPodLabels(statefulSet.Spec.Template.Labels)
+
+	if statefulSet.Labels == nil {
+		statefulSet.Labels = map[string]string{}
+	}
+
+	statefulSet.Labels[k8sPkg.ControllerNSLabel] = w.controllerNamespace
+	statefulSet.Labels[k8sPkg.ProxyStatefulSetLabel] = statefulSet.ObjectMeta.Name
+	patch.addDeploymentLabels(statefulSet.Labels)
+
+	var (
+		image    = strings.Split(proxy.Image, ":")
+		imageTag = ""
+	)
+
+	if len(image) < 2 {
+		imageTag = "latest"
+	} else {
+		imageTag = image[1]
+	}
+
+	if statefulSet.Spec.Template.Annotations == nil {
+		statefulSet.Spec.Template.Annotations = map[string]string{}
+	}
+	statefulSet.Spec.Template.Annotations[k8sPkg.CreatedByAnnotation] = fmt.Sprintf("linkerd/proxy-injector %s", imageTag)
+	statefulSet.Spec.Template.Annotations[k8sPkg.ProxyVersionAnnotation] = imageTag
+	patch.addPodAnnotations(statefulSet.Spec.Template.Annotations)
+
+	patchJSON, err := json.Marshal(patch.patchOps)
+	if err != nil {
+		return nil, err
+	}
+
+	patchType := admissionv1beta1.PatchTypeJSONPatch
+	admissionResponse := &admissionv1beta1.AdmissionResponse{
+		UID:       request.UID,
+		Allowed:   true,
+		Patch:     patchJSON,
+		PatchType: &patchType,
+	}
+
+	return admissionResponse, nil
+}
+
+func (w *Webhook) ignoreDeployment(deployment *appsv1.Deployment) bool {
 	labels := deployment.Spec.Template.ObjectMeta.GetLabels()
 	status, defined := labels[k8sPkg.ProxyAutoInjectLabel]
 	if defined {
@@ -213,6 +329,19 @@ func (w *Webhook) ignore(deployment *appsv1.Deployment) bool {
 	}
 
 	return healthcheck.HasExistingSidecars(&deployment.Spec.Template.Spec)
+}
+
+func (w *Webhook) ignoreStatefulSet(statefulSet *appsv1.StatefulSet) bool {
+	labels := statefulSet.Spec.Template.ObjectMeta.GetLabels()
+	status, defined := labels[k8sPkg.ProxyAutoInjectLabel]
+	if defined {
+		switch status {
+		case k8sPkg.ProxyAutoInjectDisabled, k8sPkg.ProxyAutoInjectCompleted:
+			return true
+		}
+	}
+
+	return healthcheck.HasExistingSidecars(&statefulSet.Spec.Template.Spec)
 }
 
 func (w *Webhook) containersSpec(identity *k8sPkg.TLSIdentity) (*corev1.Container, *corev1.Container, error) {

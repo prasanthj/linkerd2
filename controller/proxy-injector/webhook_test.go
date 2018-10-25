@@ -31,7 +31,7 @@ func init() {
 	log.SetOutput(ioutil.Discard)
 }
 
-func TestMutate(t *testing.T) {
+func TestMutateDeployment(t *testing.T) {
 	var testCases = []struct {
 		title        string
 		requestFile  string
@@ -61,7 +61,38 @@ func TestMutate(t *testing.T) {
 	}
 }
 
-func TestIgnore(t *testing.T) {
+
+func TestMutateStatefulSet(t *testing.T) {
+	var testCases = []struct {
+		title        string
+		requestFile  string
+		responseFile string
+	}{
+		{title: "no labels statefulset", requestFile: "inject-no-labels-request-statefulset.json", responseFile: "inject-no-labels-response-statefulset.yaml"},
+		{title: "inject enabled statefulset", requestFile: "inject-enabled-request-statefulset.json", responseFile: "inject-enabled-response-statefulset.yaml"},
+		{title: "inject disabled statefulset", requestFile: "inject-disabled-request-statefulset.json", responseFile: "inject-disabled-response-statefulset.yaml"},
+		{title: "inject completed statefulset", requestFile: "inject-completed-request-statefulset.json", responseFile: "inject-completed-response-statefulset.yaml"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(fmt.Sprintf("%s", testCase.title), func(t *testing.T) {
+			data, err := factory.HTTPRequestBody(testCase.requestFile)
+			if err != nil {
+				t.Fatal("Unexpected error: ", err)
+			}
+
+			expected, err := factory.AdmissionReview(testCase.responseFile)
+			if err != nil {
+				t.Fatal("Unexpected error: ", err)
+			}
+
+			actual := webhook.Mutate(data)
+			assertEqualAdmissionReview(t, expected, actual)
+		})
+	}
+}
+
+func TestIgnoreDeployment(t *testing.T) {
 	t.Run("by checking labels", func(t *testing.T) {
 		var testCases = []struct {
 			filename string
@@ -80,7 +111,7 @@ func TestIgnore(t *testing.T) {
 					t.Fatal("Unexpected error: ", err)
 				}
 
-				if actual := webhook.ignore(deployment); actual != testCase.expected {
+				if actual := webhook.ignoreDeployment(deployment); actual != testCase.expected {
 					t.Errorf("Boolean mismatch. Expected: %t. Actual: %t", testCase.expected, actual)
 				}
 			})
@@ -93,8 +124,46 @@ func TestIgnore(t *testing.T) {
 			t.Fatal("Unexpected error: ", err)
 		}
 
-		if !webhook.ignore(deployment) {
+		if !webhook.ignoreDeployment(deployment) {
 			t.Errorf("Expected deployment with injected proxy to be ignored")
+		}
+	})
+}
+
+func TestIgnoreStatefulSet(t *testing.T) {
+	t.Run("by checking labels", func(t *testing.T) {
+		var testCases = []struct {
+			filename string
+			expected bool
+		}{
+			{filename: "statefulset-inject-status-empty.yaml", expected: false},
+			{filename: "statefulset-inject-status-enabled.yaml", expected: false},
+			{filename: "statefulset-inject-status-disabled.yaml", expected: true},
+			{filename: "statefulset-inject-status-completed.yaml", expected: true},
+		}
+
+		for id, testCase := range testCases {
+			t.Run(fmt.Sprintf("%d", id), func(t *testing.T) {
+				statefulSet, err := factory.StatefulSet(testCase.filename)
+				if err != nil {
+					t.Fatal("Unexpected error: ", err)
+				}
+
+				if actual := webhook.ignoreStatefulSet(statefulSet); actual != testCase.expected {
+					t.Errorf("Boolean mismatch. Expected: %t. Actual: %t", testCase.expected, actual)
+				}
+			})
+		}
+	})
+
+	t.Run("by checking container spec", func(t *testing.T) {
+		deployment, err := factory.StatefulSet("statefulset-with-injected-proxy.yaml")
+		if err != nil {
+			t.Fatal("Unexpected error: ", err)
+		}
+
+		if !webhook.ignoreStatefulSet(deployment) {
+			t.Errorf("Expected statefulset with injected proxy to be ignored")
 		}
 	})
 }

@@ -75,6 +75,25 @@ func (f *Factory) Deployment(filename string) (*appsv1.Deployment, error) {
 	return &deployment, nil
 }
 
+// StatefulSet returns the content of the specified file as a StatefulSet type. An
+// error will be returned if:
+// i. the file doesn't exist in the 'fake/data' folder or
+// ii. the file content isn't a valid YAML structure that can be unmarshalled
+// into StatefulSet type
+func (f *Factory) StatefulSet(filename string) (*appsv1.StatefulSet, error) {
+	b, err := ioutil.ReadFile(filepath.Join(f.rootDir, filename))
+	if err != nil {
+		return nil, err
+	}
+
+	var statefulSet appsv1.StatefulSet
+	if err := yaml.Unmarshal(b, &statefulSet); err != nil {
+		return nil, err
+	}
+
+	return &statefulSet, nil
+}
+
 // Container returns the content of the specified file as a Container type. An
 // error will be returned if:
 // i. the file doesn't exist in the 'fake/data' folder or
